@@ -26,8 +26,8 @@ refer to the applicable agreement for further details.
 	(port
 		(pt 0 32)
 		(input)
-		(text "data[3..0]" (rect 0 0 53 14)(font "Arial" (font_size 8)))
-		(text "data[3..0]" (rect 4 16 57 31)(font "Arial" (font_size 8)))
+		(text "data[7..0]" (rect 0 0 53 14)(font "Arial" (font_size 8)))
+		(text "data[7..0]" (rect 4 16 57 31)(font "Arial" (font_size 8)))
 		(line (pt 0 32)(pt 112 32)(line_width 3))
 	)
 	(port
@@ -61,12 +61,12 @@ refer to the applicable agreement for further details.
 	(port
 		(pt 256 88)
 		(output)
-		(text "q[3..0]" (rect 0 0 35 14)(font "Arial" (font_size 8)))
-		(text "q[3..0]" (rect 216 72 251 87)(font "Arial" (font_size 8)))
+		(text "q[7..0]" (rect 0 0 35 14)(font "Arial" (font_size 8)))
+		(text "q[7..0]" (rect 216 72 251 87)(font "Arial" (font_size 8)))
 		(line (pt 256 88)(pt 192 88)(line_width 3))
 	)
 	(drawing
-		(text "131072 Word(s)" (rect 134 1 252 222)(font "Arial" )(vertical))
+		(text "76800 Word(s)" (rect 134 2 249 216)(font "Arial" )(vertical))
 		(text "RAM" (rect 148 -13 234 158)(font "Arial" )(vertical))
 		(text "Block Type: AUTO" (rect 40 122 174 258)(font "Arial" ))
 		(line (pt 128 24)(pt 168 24))
