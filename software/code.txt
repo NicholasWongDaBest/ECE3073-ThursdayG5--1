@@ -1,0 +1,1242 @@
+//core 0
+#include <math.h>
+#include "system.h"
+#include <stdint.h>
+#include <system.h>
+#include <io.h>
+#include <stddef.h>
+#include "sys/alt_stdio.h"
+#include "altera_avalon_pio_regs.h"
+#include "alt_types.h"
+#include <string.h>
+#include "sys/alt_irq.h"
+#include "unistd.h"
+#include <stdio.h>
+#include "includes.h"
+
+// --- RTOS GLOBALS ---
+OS_EVENT *rx_trigger_sem;
+
+volatile int rx_buffer      = 0;
+volatile int edge_capture   = 0;
+volatile int emergency_stop = 0;
+volatile int cube_mode      = 0;
+volatile int core2_fin      = 1;
+
+static void init_rx();
+static void handle_rx_interrupts(void* context, alt_u32 id);
+
+// --- MEMORY MAP ---
+int* EMER_ADDR       = (int*) 0x01E12C14;
+int* ACCE_WRADDR     = (int*) 0x01E12C00;
+int* CORE0_WRADDR    = (int*) 0x01E12C0C;
+int* SETTINGS_WRADDR = (int*) 0x01E12CA0; // byte0=rot_en, byte1=spin_en
+
+// --- RENDER CONSTANTS ---
+#define LENGTH 320
+#define WIDTH  240
+
+static float cube_size   = 15.0f;
+static float scale_const = 40.0f;
+static float focal       = 100.0f;
+static float light_x = 0.0f, light_y = 0.0f, light_z = 1.0f;
+
+static float X = 0.0f;
+static float Y = 0.0f;
+static float Z = 0.0f;
+
+static float*   buffer_z  = (float*)   0x01E25C00;
+static uint8_t* buffer_2d = (uint8_t*) 0x01E00000;
+
+static alt_32 last_ax = 0, last_ay = 0;
+
+// --- ROTATION MATRIX ---
+static float r00, r01, r02;
+static float r10, r11, r12;
+static float r20, r21, r22;
+
+// --- TRANSLATE POINT ---
+static void translate_point(float px, float py, float pz,
+                             float nx, float ny, float nz) {
+    float rx = r00*px + r01*py + r02*pz;
+    float ry = r10*px + r11*py + r12*pz;
+    float rz = r20*px + r21*py + r22*pz + focal;
+
+    if (rz <= 0.0f) return;
+
+    float rnx = r00*nx + r01*ny + r02*nz;
+    float rny = r10*nx + r11*ny + r12*nz;
+    float rnz = r20*nx + r21*ny + r22*nz;
+
+    float brightness = rnx*light_x + rny*light_y + rnz*light_z;
+    if (brightness < 0.0f) brightness = 0.0f;
+    if (brightness > 1.0f) brightness = 1.0f;
+
+    float ooz = 1.0f / rz;
+    int xp = (int)(LENGTH/2 + scale_const * rx * ooz * 2);
+    int yp = (int)(WIDTH/2  + scale_const * ry * ooz);
+
+    if (xp < 0 || xp >= LENGTH || yp < 0 || yp >= WIDTH) return;
+
+    int idx = xp + LENGTH * yp;
+    if (ooz <= buffer_z[idx]) return;
+    buffer_z[idx] = ooz;
+
+    uint8_t v = (uint8_t)(brightness * 200.0f + 55.0f);
+    uint8_t r3, g3, b2;
+
+    float anx = rnx < 0 ? -rnx : rnx;
+    float any = rny < 0 ? -rny : rny;
+    float anz = rnz < 0 ? -rnz : rnz;
+
+    if (anx >= any && anx >= anz) {
+        r3 = v >> 5; g3 = 0; b2 = 0;          // X face → red
+    } else if (any >= anx && any >= anz) {
+        r3 = 0; g3 = v >> 5; b2 = 0;          // Y face → green
+    } else {
+        r3 = 0; g3 = 0; b2 = v >> 6;          // Z face → blue
+    }
+
+    buffer_2d[idx] = (r3 << 5) | (g3 << 2) | b2;
+}
+
+// --- RENDER CUBE ---
+#define ACCEL_MAX 512.0f
+static float anim_angle = 0.0f;
+
+static void render_cube(alt_32 ax, alt_32 ay) {
+    while (!core2_fin) OSTimeDly(1);
+    core2_fin = 0;
+
+    float fax = (float)ax;
+    float fay = (float)ay;
+    if (fax >  ACCEL_MAX) fax =  ACCEL_MAX;
+    if (fax < -ACCEL_MAX) fax = -ACCEL_MAX;
+    if (fay >  ACCEL_MAX) fay =  ACCEL_MAX;
+    if (fay < -ACCEL_MAX) fay = -ACCEL_MAX;
+
+    int spin_enabled = IORD_8DIRECT(SETTINGS_WRADDR, 1);
+    int near_zero    = (ax > -30 && ax < 30 && ay > -30 && ay < 30);
+
+    if (near_zero && spin_enabled) {
+        anim_angle += 0.05f;
+        if (anim_angle > 6.2832f) anim_angle -= 6.2832f;
+        X = 0.4f;
+        Y = anim_angle;
+        Z = 0.0f;
+    } else {
+        anim_angle = 0.0f;
+        Y =  (fax / ACCEL_MAX) * 1.5708f;
+        X = -(fay / ACCEL_MAX) * 1.5708f;
+        Z =  0.0f;
+    }
+
+    float cx = cosf(X), sx = sinf(X);
+    float cy = cosf(Y), sy = sinf(Y);
+    float cz = cosf(Z), sz = sinf(Z);
+
+    r00 = cx*cy;  r01 = cx*sy*sz - sx*cz;  r02 = cx*sy*cz + sx*sz;
+    r10 = sx*cy;  r11 = sx*sy*sz + cx*cz;  r12 = sx*sy*cz - cx*sz;
+    r20 = -sy;    r21 = cy*sz;              r22 = cy*cz;
+
+    memset((void*)buffer_2d, 0, LENGTH * WIDTH * sizeof(uint8_t));
+    memset((void*)buffer_z,  0, LENGTH * WIDTH * sizeof(float));
+
+    float lo = -cube_size;
+    float hi =  cube_size - 1.0f;
+
+    for (float ci = lo; ci <= hi; ci += 1.0f) {
+        for (float cj = lo; cj <= hi; cj += 1.0f) {
+            translate_point(ci, cj, lo,  0,  0, -1);  // front
+            translate_point(ci, cj, hi,  0,  0,  1);  // back
+            translate_point(ci, lo, cj,  0, -1,  0);  // bottom
+            translate_point(ci, hi, cj,  0,  1,  0);  // top
+            translate_point(lo, ci, cj, -1,  0,  0);  // left
+            translate_point(hi, ci, cj,  1,  0,  0);  // right
+        }
+    }
+
+    // Crosshair
+    int cx_px = LENGTH / 2;
+    int cy_px = WIDTH  / 2;
+    for (int d = -3; d <= 3; d++) {
+        int px, py, idx;
+        px = cx_px + d; py = cy_px;
+        if (px >= 0 && px < LENGTH && py >= 0 && py < WIDTH) {
+            idx = py * LENGTH + px; buffer_2d[idx] = 0xE0;
+        }
+        px = cx_px; py = cy_px + d;
+        if (px >= 0 && px < LENGTH && py >= 0 && py < WIDTH) {
+            idx = py * LENGTH + px; buffer_2d[idx] = 0xE0;
+        }
+    }
+
+    IOWR_ALTERA_AVALON_PIO_DATA(IRQ_CORE0_TX_BASE, 0x00000004);
+    IOWR_ALTERA_AVALON_PIO_DATA(IRQ_CORE0_TX_BASE, 0x00000000);
+
+    last_ax = ax;
+    last_ay = ay;
+}
+
+// --- ISR ---
+static void handle_rx_interrupts(void* context, alt_u32 id) {
+    volatile int* edge_capture_ptr = (volatile int*) context;
+    int edge = IORD_ALTERA_AVALON_PIO_EDGE_CAP(IRQ_CORE0_RX_BASE);
+    *edge_capture_ptr = edge;
+    rx_buffer = edge;
+    IOWR_ALTERA_AVALON_PIO_EDGE_CAP(IRQ_CORE0_RX_BASE, edge);
+
+    if (edge & 0x00007000) {
+        cube_mode = !cube_mode;
+        if (cube_mode) rx_buffer = 0x00008000;
+    } else if (edge & 0x80000000) {
+        core2_fin = 1;
+    }
+
+    OSSemPost(rx_trigger_sem);
+}
+
+static void init_rx() {
+    void* edge_capture_ptr = (void*) &edge_capture;
+    IOWR_ALTERA_AVALON_PIO_IRQ_MASK(IRQ_CORE0_RX_BASE, 0xFFFFFFFF);
+    IOWR_ALTERA_AVALON_PIO_EDGE_CAP(IRQ_CORE0_RX_BASE, 0);
+    alt_irq_register(IRQ_CORE0_RX_IRQ, edge_capture_ptr, handle_rx_interrupts);
+}
+
+// --- TASKS ---
+#define TASK_STACKSIZE 1024
+OS_STK accel_task_stk  [TASK_STACKSIZE];
+OS_STK startup_task_stk[TASK_STACKSIZE];
+
+#define ACCEL_PRIORITY 1
+
+void accel_task(void* pdata) {
+    INT8U err;
+    while (1) {
+        OSSemPend(rx_trigger_sem, 0, &err);
+
+        if (rx_buffer & 0x00008000) {
+            int32_t received_x = (int32_t) IORD_32DIRECT(ACCE_WRADDR, 0);
+            int32_t received_y = (int32_t) IORD_32DIRECT(ACCE_WRADDR, 4);
+            int32_t received_z = (int32_t) IORD_32DIRECT(ACCE_WRADDR, 8);
+            rx_buffer = 0x0;
+
+            if (received_z < -208 && !emergency_stop) {
+                IOWR_ALTERA_AVALON_PIO_DATA(IRQ_CORE0_TX_BASE, 0x00010001);
+                IOWR_ALTERA_AVALON_PIO_DATA(IRQ_CORE0_TX_BASE, 0x00000000);
+                emergency_stop = 1;
+                alt_printf("DEVICE UPSIDE DOWN\n");
+            }
+            if (received_z > -208 && emergency_stop) {
+                IOWR_ALTERA_AVALON_PIO_DATA(IRQ_CORE0_TX_BASE, 0x00020002);
+                IOWR_ALTERA_AVALON_PIO_DATA(IRQ_CORE0_TX_BASE, 0x00000000);
+                emergency_stop = 0;
+                alt_printf("DEVICE BACK ALIVE\n");
+            }
+
+            IOWR_32DIRECT(CORE0_WRADDR, 0, OSCPUUsage);
+
+            if (cube_mode) {
+                alt_32 ax = (received_x != 0 || last_ax == 0) ? received_x : last_ax;
+                alt_32 ay = (received_y != 0 || last_ay == 0) ? received_y : last_ay;
+                render_cube(ax, ay);
+            }
+        }
+    }
+}
+
+void startup_task(void* pdata) {
+    OSStatInit();
+    OSTaskCreateExt(accel_task, NULL, (void*)&accel_task_stk[TASK_STACKSIZE-1],
+                    ACCEL_PRIORITY, ACCEL_PRIORITY, accel_task_stk, TASK_STACKSIZE, NULL, 0);
+    OSTaskDel(OS_PRIO_SELF);
+}
+
+int main(void) {
+    alt_printf("=========================================================\n");
+    alt_printf("CPU Core 0 Alive\n");
+    alt_printf("=========================================================\n");
+    rx_trigger_sem = OSSemCreate(0);
+    init_rx();
+    OSTaskCreateExt(startup_task, NULL, (void*)&startup_task_stk[TASK_STACKSIZE-1],
+                    0, 0, startup_task_stk, TASK_STACKSIZE, NULL, 0);
+    OSStart();
+    return 0;
+}
+
+// core 1
+#include "system.h"
+#include <stdio.h>
+#include <stdint.h>
+#include <system.h>
+#include <io.h>
+#include "altera_avalon_spi.h"
+#include "altera_avalon_spi_regs.h"
+#include <stddef.h>
+#include "sys/alt_stdio.h"
+#include "altera_avalon_pio_regs.h"
+#include "alt_types.h"
+#include <string.h>
+#include "altera_up_avalon_accelerometer_spi.h"
+#include "sys/alt_irq.h"
+#include "unistd.h"
+#include "includes.h"
+
+// --- ROTATION ---
+volatile int rotation = 0;
+
+// --- RTOS GLOBALS ---
+OS_EVENT *accel_sem;
+OS_EVENT *music_sem;
+
+// --- MEMORY MAP ---
+int* DRAM_WRADDR     = (int*) 0x01E00000;
+int* ACCE_WRADDR     = (int*) 0x01E12C00;
+int* CORE0_WRADDR    = (int*) 0x01E12C0C;
+int* CORE2_WRADDR    = (int*) 0x01E12C20;
+int* CORE1_WRADDR    = (int*) 0x01E12C40;
+int* SCORE_WRADDR    = (int*) 0x01E12C50;
+int* WORD_WRADDR     = (int*) 0x01E12C80;
+int* SETTINGS_WRADDR = (int*) 0x01E12CA0;
+#define SPI_BASE 0x84001040
+
+// ── IRQ bit assignments (Core1 TX → Core0/Core2 RX) ──
+// 0x80000000  camera frame complete  (Core1 → Core0+Core2)
+// 0x40000000  camera ON  (explicit)  (Core1 → Core2)
+// 0x08000000  camera OFF (explicit)  (Core1 → Core2)
+// 0x20000000  KEY1 (next page / skip setting)
+// 0x10000000  KEY0 (prev page / confirm setting)
+// 0x00007000  cube mode toggle       (Core1 → Core0)
+// 0x00008000  accel data ready       (Core1 → Core0)
+// 0x00010001  emergency ON           (Core0 → Core1+Core2)
+// 0x00020002  emergency OFF
+
+// --- INTERRUPT GLOBALS ---
+volatile int edge_capture   = 0;
+volatile int start_spi      = 0;
+volatile int emergency_stop = 0;
+volatile int scroll_flag    = 0;
+volatile int video_mode     = 0;
+
+alt_up_accelerometer_spi_dev *accel;
+
+void display_6chars(char* msg, int offset, int len);
+unsigned char get_seg7(char c);
+void play_tone();
+
+unsigned char seg7_alpha[]   = {0x88,0x83,0xC6,0xA1,0x86,0x8E,0xC2,0x89,0xF9,0xE1,0x89,0xC7,0xC8,0xAB,0xC0,0x8C,0x98,0xAF,0x92,0x87,0xC1,0xC1,0xC1,0x89,0x91,0xA4,0xFF};
+unsigned char seg7_numbers[] = {0xC0,0xF9,0xA4,0xB0,0x99,0x92,0x82,0xF8,0x80,0x90};
+
+static void handle_rx_interrupts(void* context, alt_u32 id) {
+    int edge = IORD_ALTERA_AVALON_PIO_EDGE_CAP(IRQ_CORE1_RX_BASE);
+    if (edge & 0x00010000) emergency_stop = 1;
+    if (edge & 0x00020000) emergency_stop = 0;
+    IOWR_ALTERA_AVALON_PIO_EDGE_CAP(IRQ_CORE1_RX_BASE, edge);
+}
+
+static void handle_key_interrupts(void* context, alt_u32 id) {
+    int edge = IORD_ALTERA_AVALON_PIO_EDGE_CAP(PUSH_BUTTONS_BASE);
+    if (edge & 0x1) {   // KEY0 → prev page / confirm setting
+        IOWR_ALTERA_AVALON_PIO_DATA(IRQ_CORE1_TX_BASE, 0x10000000);
+        IOWR_ALTERA_AVALON_PIO_DATA(IRQ_CORE1_TX_BASE, 0x00000000);
+    }
+    if (edge & 0x2) {   // KEY1 → next page / skip setting
+        IOWR_ALTERA_AVALON_PIO_DATA(IRQ_CORE1_TX_BASE, 0x20000000);
+        IOWR_ALTERA_AVALON_PIO_DATA(IRQ_CORE1_TX_BASE, 0x00000000);
+    }
+    IOWR_ALTERA_AVALON_PIO_EDGE_CAP(PUSH_BUTTONS_BASE, 0);
+}
+
+static void handle_timer_interrupts(void* context, alt_u32 id) {
+    int edge = IORD_ALTERA_AVALON_PIO_EDGE_CAP(CLOCK_INTERRUPT_BASE);
+    if (edge & 0x1) scroll_flag = 1;
+    if (edge & 0x2) OSSemPost(accel_sem);
+    IOWR_ALTERA_AVALON_PIO_EDGE_CAP(CLOCK_INTERRUPT_BASE, 0);
+}
+
+static void init_rx() {
+    IOWR_ALTERA_AVALON_PIO_IRQ_MASK(IRQ_CORE1_RX_BASE, 0xFFFFFFFF);
+    IOWR_ALTERA_AVALON_PIO_EDGE_CAP(IRQ_CORE1_RX_BASE, 0);
+    alt_irq_register(IRQ_CORE1_RX_IRQ, (void*)&edge_capture, handle_rx_interrupts);
+}
+static void init_key_pio() {
+    IOWR_ALTERA_AVALON_PIO_IRQ_MASK(PUSH_BUTTONS_BASE, 0x3);
+    IOWR_ALTERA_AVALON_PIO_EDGE_CAP(PUSH_BUTTONS_BASE, 0);
+    alt_irq_register(PUSH_BUTTONS_IRQ, (void*)&edge_capture, handle_key_interrupts);
+}
+static void init_timer() {
+    IOWR_ALTERA_AVALON_PIO_IRQ_MASK(CLOCK_INTERRUPT_BASE, 0x3);
+    IOWR_ALTERA_AVALON_PIO_EDGE_CAP(CLOCK_INTERRUPT_BASE, 0);
+    alt_irq_register(CLOCK_INTERRUPT_IRQ, NULL, handle_timer_interrupts);
+}
+
+unsigned char get_seg7(char c) {
+    if (c >= 'A' && c <= 'Z') return seg7_alpha[c - 'A'];
+    if (c >= 'a' && c <= 'z') return seg7_alpha[c - 'a'];
+    if (c >= '0' && c <= '9') return seg7_numbers[c - '0'];
+    if (c == ' ') return 0xFF;
+    if (c == '-') return 0xBF;
+    if (c == '.') return 0x7F;
+    return 0xFF;
+}
+
+void display_6chars(char* msg, int offset, int len) {
+    char chars[6];
+    for (int i = 0; i < 6; i++) chars[i] = msg[(offset + i) % len];
+    unsigned int hex012 = (get_seg7(chars[3]) << 16) | (get_seg7(chars[4]) << 8) | get_seg7(chars[5]);
+    unsigned int hex345 = (get_seg7(chars[0]) << 16) | (get_seg7(chars[1]) << 8) | get_seg7(chars[2]);
+    IOWR_ALTERA_AVALON_PIO_DATA(HEX012_BASE, hex012);
+    IOWR_ALTERA_AVALON_PIO_DATA(HEX345_BASE, hex345);
+}
+
+// NOTE defines (only the ones used)
+#define NOTE_REST 0
+#define NOTE_D4  10
+#define NOTE_E4  12
+#define NOTE_F4  13
+#define NOTE_G4  15
+#define NOTE_A4  17
+#define NOTE_AS4 18
+#define NOTE_C5  20
+
+void play_tone() {
+    IOWR_ALTERA_AVALON_PIO_DATA(BUZZER_BASE, NOTE_G4);  OSTimeDlyHMSM(0,0,0,900);
+    IOWR_ALTERA_AVALON_PIO_DATA(BUZZER_BASE, NOTE_A4);  OSTimeDlyHMSM(0,0,0,150);
+    IOWR_ALTERA_AVALON_PIO_DATA(BUZZER_BASE, NOTE_AS4); OSTimeDlyHMSM(0,0,0,150);
+    IOWR_ALTERA_AVALON_PIO_DATA(BUZZER_BASE, NOTE_G4);  OSTimeDlyHMSM(0,0,0,600);
+    IOWR_ALTERA_AVALON_PIO_DATA(BUZZER_BASE, NOTE_F4);  OSTimeDlyHMSM(0,0,0,550);
+    IOWR_ALTERA_AVALON_PIO_DATA(BUZZER_BASE, NOTE_REST);OSTimeDlyHMSM(0,0,0,100);
+    IOWR_ALTERA_AVALON_PIO_DATA(BUZZER_BASE, NOTE_F4);  OSTimeDlyHMSM(0,0,0,550);
+    IOWR_ALTERA_AVALON_PIO_DATA(BUZZER_BASE, NOTE_D4);  OSTimeDlyHMSM(0,0,0,600);
+    IOWR_ALTERA_AVALON_PIO_DATA(BUZZER_BASE, NOTE_E4);  OSTimeDlyHMSM(0,0,1,200);
+    IOWR_ALTERA_AVALON_PIO_DATA(BUZZER_BASE, NOTE_G4);  OSTimeDlyHMSM(0,0,0,900);
+    IOWR_ALTERA_AVALON_PIO_DATA(BUZZER_BASE, NOTE_A4);  OSTimeDlyHMSM(0,0,0,150);
+    IOWR_ALTERA_AVALON_PIO_DATA(BUZZER_BASE, NOTE_AS4); OSTimeDlyHMSM(0,0,0,150);
+    IOWR_ALTERA_AVALON_PIO_DATA(BUZZER_BASE, NOTE_G4);  OSTimeDlyHMSM(0,0,0,600);
+    IOWR_ALTERA_AVALON_PIO_DATA(BUZZER_BASE, NOTE_F4);  OSTimeDlyHMSM(0,0,0,550);
+    IOWR_ALTERA_AVALON_PIO_DATA(BUZZER_BASE, NOTE_REST);OSTimeDlyHMSM(0,0,0,100);
+    IOWR_ALTERA_AVALON_PIO_DATA(BUZZER_BASE, NOTE_F4);  OSTimeDlyHMSM(0,0,0,550);
+    IOWR_ALTERA_AVALON_PIO_DATA(BUZZER_BASE, NOTE_AS4); OSTimeDlyHMSM(0,0,0,600);
+    IOWR_ALTERA_AVALON_PIO_DATA(BUZZER_BASE, NOTE_C5);  OSTimeDlyHMSM(0,0,1,200);
+    IOWR_ALTERA_AVALON_PIO_DATA(BUZZER_BASE, NOTE_REST);
+}
+
+// --- TASK 1: CAMERA SPI ---
+#define PAYLOAD_BYTES 60
+#define SPI_WORDS ((PAYLOAD_BYTES + 4) / 4)
+
+volatile char detected_msg[11] = "NO IFR ";
+volatile char word_msg[17]     = "NO WORD   ";
+volatile int  word_new_flag    = 0;
+int timeout = 0;
+
+void camera_spi_task(void* pdata) {
+    int offset_write = 0;
+    int write_len    = 0;
+    uint32_t buffer[SPI_WORDS];
+    int trigger_sent = 0;
+
+    while (1) {
+        video_mode = start_spi ? 1 : 0;
+
+        if (trigger_sent == 0) {
+            IOWR_ALTERA_AVALON_SPI_SLAVE_SEL(SPI_BASE, 0x1);
+            if (start_spi) {
+                uint8_t rot_en = IORD_8DIRECT(SETTINGS_WRADDR, 0);
+                int rot_val    = rot_en ? (rotation & 0x3) : 0;
+                IOWR_ALTERA_AVALON_SPI_TXDATA(SPI_BASE, 0x01 | (rot_val << 2));
+            } else {
+                IOWR_ALTERA_AVALON_SPI_TXDATA(SPI_BASE, 0x02);
+            }
+            while (!(IORD_ALTERA_AVALON_SPI_STATUS(SPI_BASE) & 0x80));
+            IORD_ALTERA_AVALON_SPI_RXDATA(SPI_BASE);
+            IOWR_ALTERA_AVALON_SPI_SLAVE_SEL(SPI_BASE, 0x0);
+            trigger_sent = 1;
+        }
+
+        OSSchedLock();
+        IOWR_ALTERA_AVALON_SPI_CONTROL(SPI_BASE, 0x400);
+        IOWR_ALTERA_AVALON_SPI_SLAVE_SEL(SPI_BASE, 0x1);
+        for (uint8_t bi = 0; bi < SPI_WORDS; bi++) {
+            while (!(IORD_ALTERA_AVALON_SPI_STATUS(SPI_BASE) & 0x40));
+            IOWR_ALTERA_AVALON_SPI_TXDATA(SPI_BASE, 0x00);
+            while (!(IORD_ALTERA_AVALON_SPI_STATUS(SPI_BASE) & 0x80));
+            buffer[bi] = IORD_ALTERA_AVALON_SPI_RXDATA(SPI_BASE);
+        }
+        IOWR_ALTERA_AVALON_SPI_SLAVE_SEL(SPI_BASE, 0x0);
+        IOWR_ALTERA_AVALON_SPI_CONTROL(SPI_BASE, 0x000);
+        OSSchedUnlock();
+
+        // START FRAME
+        if (buffer[0] == 0xFF00FF00 && buffer[1] == 0xFF00FF00) {
+            offset_write = 0; write_len = 0;
+            OSTimeDlyHMSM(0,0,0,1);
+            continue;
+        }
+
+        // END FRAME
+        if (buffer[0] == 0xEE11EE11 && buffer[1] == 0xEE11EE11) {
+            timeout = 0;
+            if (write_len == 76800) {
+                IOWR_ALTERA_AVALON_PIO_DATA(IRQ_CORE1_TX_BASE, 0x80000000);
+                IOWR_ALTERA_AVALON_PIO_DATA(IRQ_CORE1_TX_BASE, 0x00000000);
+                IOWR_ALTERA_AVALON_PIO_DATA(ONBOARD_LEDS_BASE, 0x0);
+            } else {
+                IOWR_ALTERA_AVALON_PIO_DATA(ONBOARD_LEDS_BASE, 0x200);
+            }
+            write_len = 0; trigger_sent = 0;
+            OSTimeDlyHMSM(0,0,0,1);
+            continue;
+        } else {
+            if (timeout >= 1500) { trigger_sent = 0; timeout = 0; }
+            timeout++;
+        }
+
+        // C0C0 inference metadata
+        if ((buffer[0] >> 16) == 0xC0C0 && (buffer[SPI_WORDS-1] & 0xFFFF) == 0xC0C0) {
+            char lbl[7];
+            lbl[0]=(buffer[0]>>8)&0xFF; lbl[1]=buffer[0]&0xFF;
+            lbl[2]=(buffer[1]>>24)&0xFF;lbl[3]=(buffer[1]>>16)&0xFF;
+            lbl[4]=(buffer[1]>>8)&0xFF; lbl[5]=buffer[1]&0xFF; lbl[6]='\0';
+            for (int i=5;i>=0;i--){if(lbl[i]=='\0'||lbl[i]==' ')lbl[i]='\0';else break;}
+            uint8_t avg_conf=(buffer[2]>>24)&0xFF;
+            snprintf((char*)detected_msg,11,"%-2s-%03d  ",lbl,avg_conf);
+        }
+        // A0A0 image pixels
+        else if ((buffer[0]>>16)==0xA0A0 && (buffer[SPI_WORDS-1]&0xFFFF)==0xA0A0) {
+            if (start_spi) {
+                int pw = PAYLOAD_BYTES/4;
+                for (int i=0;i<pw;i++){
+                    uint32_t word=(buffer[i]<<16)|(buffer[i+1]>>16);
+                    IOWR_32DIRECT(DRAM_WRADDR,offset_write,word);
+                    offset_write+=4; write_len+=4;
+                }
+            }
+        }
+        // D0D0 word-match packet
+        else if ((buffer[0]>>16)==0xD0D0 && (buffer[SPI_WORDS-1]&0xFFFF)==0xD0D0) {
+            uint8_t flag=(buffer[4]>>16)&0xFF;
+            if (flag==0x01) {
+                char tmp[17]={0};
+                tmp[0]=(buffer[0]>>8)&0xFF;  tmp[1]=buffer[0]&0xFF;
+                tmp[2]=(buffer[1]>>24)&0xFF; tmp[3]=(buffer[1]>>16)&0xFF;
+                tmp[4]=(buffer[1]>>8)&0xFF;  tmp[5]=buffer[1]&0xFF;
+                tmp[6]=(buffer[2]>>24)&0xFF; tmp[7]=(buffer[2]>>16)&0xFF;
+                tmp[8]=(buffer[2]>>8)&0xFF;  tmp[9]=buffer[2]&0xFF;
+                tmp[10]=(buffer[3]>>24)&0xFF;tmp[11]=(buffer[3]>>16)&0xFF;
+                tmp[12]=(buffer[3]>>8)&0xFF; tmp[13]=buffer[3]&0xFF;
+                tmp[14]=(buffer[4]>>24)&0xFF;tmp[15]=' ';tmp[16]='\0';
+                strncpy((char*)word_msg,tmp,16);
+                word_msg[16]='\0'; word_new_flag=1;
+            }
+        }
+        // E0E0 score packet
+        else if ((buffer[0]>>16)==0xE0E0 && (buffer[SPI_WORDS-1]&0xFFFF)==0xE0E0) {
+            uint8_t raw[64];
+            for (int w=0;w<SPI_WORDS;w++){
+                raw[w*4+0]=(buffer[w]>>24)&0xFF; raw[w*4+1]=(buffer[w]>>16)&0xFF;
+                raw[w*4+2]=(buffer[w]>>8)&0xFF;  raw[w*4+3]=buffer[w]&0xFF;
+            }
+            for (int i=0;i<36;i++) IOWR_8DIRECT(SCORE_WRADDR,i,raw[2+i]);
+            for (int i=0;i<16;i++) IOWR_8DIRECT(WORD_WRADDR, i,raw[38+i]);
+            if (raw[53]==0x01){
+                for (int i=0;i<15;i++) word_msg[i]=(char)raw[38+i];
+                word_msg[15]=' '; word_msg[16]='\0'; word_new_flag=1;
+            }
+            if (!start_spi) trigger_sent=0;
+        }
+
+        OSTimeDlyHMSM(0,0,0,start_spi?1:10);
+    }
+}
+
+// --- TASK 2: ACCELEROMETER ---
+void accel_task(void* pdata) {
+    INT8U err;
+    alt_32 x, y, z;
+    int emergency_led = 0;
+    while (1) {
+        OSSemPend(accel_sem, 0, &err);
+        alt_up_accelerometer_spi_read_x_axis(accel, &x);
+        alt_up_accelerometer_spi_read_y_axis(accel, &y);
+        alt_up_accelerometer_spi_read_z_axis(accel, &z);
+        IOWR_32DIRECT(ACCE_WRADDR, 0, (uint32_t)x);
+        IOWR_32DIRECT(ACCE_WRADDR, 4, (uint32_t)y);
+        IOWR_32DIRECT(ACCE_WRADDR, 8, (uint32_t)z);
+        IOWR_ALTERA_AVALON_PIO_DATA(IRQ_CORE1_TX_BASE, 0x00008000);
+        IOWR_ALTERA_AVALON_PIO_DATA(IRQ_CORE1_TX_BASE, 0x00000000);
+        if (z < -208) {
+            IOWR_ALTERA_AVALON_PIO_DATA(ONBOARD_LEDS_BASE, emergency_led ? 0x3FF : 0x000);
+            emergency_led = !emergency_led;
+        } else {
+            if      (x < -250 && y > -200) rotation = 1;
+            else if (x >  230 && y > -200) rotation = 2;
+            else if (          y < -240)   rotation = 3;
+            else                           rotation = 0;
+        }
+    }
+}
+
+// --- TASK 3: UI (7-seg + switch handling) ---
+void ui_task(void* pdata) {
+    int     scroll_offset = 0;
+    char    cpu_message[7] = "C0-000";
+    uint8_t cpu_idx        = 0;
+    int     prev_sw4 = 0, prev_sw5 = 0, prev_sw6 = 0;
+
+    while (1) {
+        OSTimeDly(2);
+
+        char* message = (char*)detected_msg;
+        int   len     = strlen(message);
+        if (len == 0) len = 1;
+
+        int sw   = IORD_ALTERA_AVALON_PIO_DATA(SWITCHES_BASE);
+        int sw1  = (sw >> 0) & 0x1;
+        int sw2  = (sw >> 1) & 0x1;
+        int sw3  = (sw >> 2) & 0x1;
+        int sw4  = (sw >> 3) & 0x1;
+        int sw5  = (sw >> 4) & 0x1;  // cube mode
+        int sw6  = (sw >> 5) & 0x1;  // camera ON/OFF
+        int sw10 = (sw >> 9) & 0x1;
+
+        if (!emergency_stop) {
+            // Music
+            if (sw4 && !prev_sw4) OSSemPost(music_sem);
+
+            // Camera ON/OFF — SW6 rising edge
+            // Send EXPLICIT on/off signal (not toggle) to avoid state drift
+            if (sw6 && !prev_sw6) {
+                start_spi = !start_spi;
+                if (start_spi) {
+                    // Camera just turned ON → explicit ON signal to Core 2
+                    IOWR_ALTERA_AVALON_PIO_DATA(IRQ_CORE1_TX_BASE, 0x40000000);
+                    IOWR_ALTERA_AVALON_PIO_DATA(IRQ_CORE1_TX_BASE, 0x00000000);
+                } else {
+                    // Camera just turned OFF → explicit OFF signal to Core 2
+                    IOWR_ALTERA_AVALON_PIO_DATA(IRQ_CORE1_TX_BASE, 0x08000000);
+                    IOWR_ALTERA_AVALON_PIO_DATA(IRQ_CORE1_TX_BASE, 0x00000000);
+                }
+            }
+
+            // Cube mode — SW5 rising edge
+            if (sw5 && !prev_sw5) {
+                // If camera was running, explicitly turn it off in Core 2
+                if (start_spi) {
+                    IOWR_ALTERA_AVALON_PIO_DATA(IRQ_CORE1_TX_BASE, 0x08000000);
+                    IOWR_ALTERA_AVALON_PIO_DATA(IRQ_CORE1_TX_BASE, 0x00000000);
+                    start_spi  = 0;
+                    video_mode = 0;
+                }
+                // Toggle cube mode in Core 0, clear cube in Core 2
+                IOWR_ALTERA_AVALON_PIO_DATA(IRQ_CORE1_TX_BASE, 0x00007000);
+                IOWR_ALTERA_AVALON_PIO_DATA(IRQ_CORE1_TX_BASE, 0x00000000);
+            }
+
+            prev_sw4 = sw4;
+            prev_sw5 = sw5;
+            prev_sw6 = sw6;
+
+            if (sw10) IOWR_ALTERA_AVALON_PIO_DATA(ONBOARD_LEDS_BASE, 0x0);
+
+            if (!scroll_flag) { continue; }
+            scroll_flag = 0;
+
+            if (!sw1) {
+                scroll_offset = 0;
+                IOWR_ALTERA_AVALON_PIO_DATA(HEX012_BASE, 0xFFFFFF);
+                IOWR_ALTERA_AVALON_PIO_DATA(HEX345_BASE, 0xFFFFFF);
+            } else if (sw1 && sw2) {
+                if (sw3) {
+                    int core_state = cpu_idx / 4;
+                    if      (core_state == 0) { int v=IORD_32DIRECT(CORE0_WRADDR,0); snprintf(cpu_message,7,"C0-%03d",v); }
+                    else if (core_state == 1) { snprintf(cpu_message,7,"C1-%03d",OSCPUUsage); }
+                    else if (core_state == 2) { int v=IORD_32DIRECT(CORE2_WRADDR,0); snprintf(cpu_message,7,"C2-%03d",v); }
+                    display_6chars(cpu_message, 0, strlen(cpu_message));
+                    if (++cpu_idx >= 12) cpu_idx = 0;
+                } else {
+                    char* wm   = (char*)word_msg;
+                    int   wlen = strlen(wm);
+                    if (wlen == 0) wlen = 1;
+                    display_6chars(wm, scroll_offset, wlen);
+                    scroll_offset = (scroll_offset + 1) % wlen;
+                }
+            } else {
+                display_6chars(message, scroll_offset, len);
+            }
+        }
+        IOWR_32DIRECT(CORE1_WRADDR, 0, OSCPUUsage);
+    }
+}
+
+// --- TASK 4: MUSIC ---
+void music_task(void* pdata) {
+    INT8U err;
+    while (1) {
+        OSSemPend(music_sem, 0, &err);
+        while (OSSemAccept(music_sem) > 0);
+        play_tone();
+    }
+}
+
+#define TASK_STACKSIZE 1024
+OS_STK camera_task_stk [TASK_STACKSIZE];
+OS_STK accel_task_stk  [TASK_STACKSIZE];
+OS_STK ui_task_stk     [TASK_STACKSIZE];
+OS_STK startup_task_stk[TASK_STACKSIZE];
+OS_STK music_task_stk  [TASK_STACKSIZE];
+
+#define CAMERA_PRIORITY 1
+#define ACCEL_PRIORITY  2
+#define UI_PRIORITY     3
+#define MUSIC_PRIORITY  4
+
+void startup_task(void* pdata) {
+    OSStatInit();
+    OSTaskCreateExt(camera_spi_task, NULL, (void*)&camera_task_stk[TASK_STACKSIZE-1], CAMERA_PRIORITY, CAMERA_PRIORITY, camera_task_stk, TASK_STACKSIZE, NULL, 0);
+    OSTaskCreateExt(accel_task,      NULL, (void*)&accel_task_stk [TASK_STACKSIZE-1], ACCEL_PRIORITY,  ACCEL_PRIORITY,  accel_task_stk,  TASK_STACKSIZE, NULL, 0);
+    OSTaskCreateExt(ui_task,         NULL, (void*)&ui_task_stk    [TASK_STACKSIZE-1], UI_PRIORITY,     UI_PRIORITY,     ui_task_stk,     TASK_STACKSIZE, NULL, 0);
+    OSTaskCreateExt(music_task,      NULL, (void*)&music_task_stk [TASK_STACKSIZE-1], MUSIC_PRIORITY,  MUSIC_PRIORITY,  music_task_stk,  TASK_STACKSIZE, NULL, 0);
+    OSTaskDel(OS_PRIO_SELF);
+}
+
+int main(void) {
+    alt_printf("=========================================================\n");
+    alt_printf("CPU Core 1 Alive\n");
+    alt_printf("=========================================================\n");
+    accel = alt_up_accelerometer_spi_open_dev("/dev/accelerometer_spi_0");
+    if (!accel) { alt_printf("Failed to open accelerometer\n"); return 1; }
+    IOWR_ALTERA_AVALON_PIO_DATA(ONBOARD_LEDS_BASE, 0x0);
+    accel_sem = OSSemCreate(0);
+    music_sem = OSSemCreate(0);
+    init_rx(); init_key_pio(); init_timer();
+    OSTaskCreateExt(startup_task, NULL, (void*)&startup_task_stk[TASK_STACKSIZE-1], 0, 0, startup_task_stk, TASK_STACKSIZE, NULL, 0);
+    OSStart();
+    return 0;
+}
+
+// core 2
+#include <image.h>
+#include <emergencyIMG2.h>
+#include "system.h"
+#include <stdio.h>
+#include <stdint.h>
+#include <system.h>
+#include <io.h>
+#include <stddef.h>
+#include "sys/alt_stdio.h"
+#include "altera_avalon_pio_regs.h"
+#include "alt_types.h"
+#include <string.h>
+#include "sys/alt_irq.h"
+#include "unistd.h"
+#include "includes.h"
+
+OS_EVENT *vga_trigger_sem;
+
+int* CORE0_WRADDR    = (int*) 0x01E12C0C;
+int* CORE2_WRADDR    = (int*) 0x01E12C20;
+int* CORE1_WRADDR    = (int*) 0x01E12C40;
+int* DRAM_WRADDR     = (int*) 0x01E00000;
+int* ACCE_WRADDR     = (int*) 0x01E12C00;
+int* EMER_ADDR       = (int*) 0x01E12C14;
+int* SCORE_WRADDR    = (int*) 0x01E12C50;
+int* WORD_WRADDR     = (int*) 0x01E12C80;
+int* SETTINGS_WRADDR = (int*) 0x01E12CA0;
+
+volatile int edge_capture      = 0;
+volatile int rx_buffer         = 0;
+volatile int emergency_stop    = 0;
+volatile int emergency_counter = 0;
+volatile int is_cube           = 0;
+volatile int is_spi            = 0;
+volatile int key0_click        = 0;
+volatile int key1_click        = 0;
+
+static int current_page    = 0;
+static int settings_cursor = 0;
+static int settings_rot    = 1;
+static int settings_spin   = 1;
+
+// Partial-update tracking
+static int last_page    = -1;  // -1 forces full redraw on first frame
+static int force_redraw =  1;
+
+static uint8_t cube_buf[320 * 240];
+
+static void init_rx();
+static void handle_rx_interrupts(void* context, alt_u32 id);
+static void draw_ui_page(int page);
+static void draw_ui_page_partial(void);
+void write_pixel_array(const uint8_t* ADDRESS);
+
+static void init_rx() {
+    void* p = (void*) &edge_capture;
+    IOWR_ALTERA_AVALON_PIO_IRQ_MASK(IRQ_CORE2_RX_BASE, 0xFFFFFFFF);
+    IOWR_ALTERA_AVALON_PIO_EDGE_CAP(IRQ_CORE2_RX_BASE, 0);
+    alt_irq_register(IRQ_CORE2_RX_IRQ, p, handle_rx_interrupts);
+}
+
+static void handle_rx_interrupts(void* context, alt_u32 id) {
+    volatile int* edge_capture_ptr = (volatile int*) context;
+    int edge = IORD_ALTERA_AVALON_PIO_EDGE_CAP(IRQ_CORE2_RX_BASE);
+
+    if (edge & 0x00000001) emergency_stop = 1;
+    if (edge & 0x00000002) emergency_stop = 0;
+    *edge_capture_ptr = edge;
+
+    if (edge & 0x80000000) { rx_buffer |= 0x80000000; OSSemPost(vga_trigger_sem); }
+    if (edge & 0x40000000) { is_spi = 1; is_cube = 0;  OSSemPost(vga_trigger_sem); }
+    if (edge & 0x08000000) { is_spi = 0;               OSSemPost(vga_trigger_sem); }
+    if (edge & 0x00007000) { is_cube = 0; rx_buffer &= ~0x00000004; OSSemPost(vga_trigger_sem); }
+    if (edge & 0x10000000) { key0_click = 1;            OSSemPost(vga_trigger_sem); }
+    if (edge & 0x20000000) { key1_click = 1;            OSSemPost(vga_trigger_sem); }
+    if (edge & 0x00000004) { rx_buffer |= 0x00000004; is_cube = 1; OSSemPost(vga_trigger_sem); }
+    else if (edge & 0x00000003) { OSSemPost(vga_trigger_sem); }
+
+    IOWR_ALTERA_AVALON_PIO_EDGE_CAP(IRQ_CORE2_RX_BASE, edge);
+}
+
+// ============================================================================
+// FONT + PRIMITIVES
+// ============================================================================
+static const char UI_FONT_CHARS[] = " -:./0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZ%<>";
+static const uint8_t UI_FONT_DATA[43][6] = {
+    {0x0,0x0,0x0,0x0,0x0,0x0},{0x0,0x0,0xF,0x0,0x0,0x0},{0x0,0x6,0x6,0x0,0x6,0x6},
+    {0x0,0x0,0x0,0x0,0x0,0xF},{0x1,0x2,0x4,0x8,0x4,0x2},{0x6,0x9,0x9,0x9,0x9,0x6},
+    {0x2,0x6,0x2,0x2,0x2,0x7},{0x6,0x9,0x1,0x2,0x4,0xF},{0xE,0x1,0x6,0x1,0x1,0xE},
+    {0x9,0x9,0xF,0x1,0x1,0x1},{0xF,0x8,0xE,0x1,0x1,0xE},{0x6,0x8,0xE,0x9,0x9,0x6},
+    {0xF,0x1,0x2,0x4,0x4,0x4},{0x6,0x9,0x6,0x9,0x9,0x6},{0x6,0x9,0x7,0x1,0x9,0x6},
+    {0x6,0x9,0x9,0xF,0x9,0x9},{0xE,0x9,0xE,0x9,0x9,0xE},{0x6,0x9,0x8,0x8,0x9,0x6},
+    {0xE,0x9,0x9,0x9,0x9,0xE},{0xF,0x8,0xE,0x8,0x8,0xF},{0xF,0x8,0xE,0x8,0x8,0x8},
+    {0x6,0x9,0x8,0xB,0x9,0x6},{0x9,0x9,0xF,0x9,0x9,0x9},{0xE,0x4,0x4,0x4,0x4,0xE},
+    {0x3,0x1,0x1,0x1,0x9,0x6},{0x9,0xA,0xC,0xC,0xA,0x9},{0x8,0x8,0x8,0x8,0x8,0xF},
+    {0x9,0xF,0x9,0x9,0x9,0x9},{0x9,0xD,0xB,0x9,0x9,0x9},{0x6,0x9,0x9,0x9,0x9,0x6},
+    {0xE,0x9,0x9,0xE,0x8,0x8},{0x6,0x9,0x9,0x9,0xD,0x6},{0xE,0x9,0x9,0xE,0xA,0x9},
+    {0x7,0x8,0x6,0x1,0x1,0xE},{0xF,0x4,0x4,0x4,0x4,0x4},{0x9,0x9,0x9,0x9,0x9,0x6},
+    {0x9,0x9,0x9,0x9,0x6,0x6},{0x9,0x9,0xF,0xF,0x9,0x9},{0x9,0x9,0x6,0x6,0x9,0x9},
+    {0x9,0x9,0x6,0x4,0x4,0x4},{0xF,0x1,0x2,0x4,0x8,0xF},{0x1,0xA,0x2,0x4,0x5,0x8},
+    {0x2,0x4,0x8,0x4,0x2,0x0},{0x4,0x2,0x1,0x2,0x4,0x0},
+};
+
+#define UI_BLACK  0x00
+#define UI_WHITE  0xFF
+#define UI_YELLOW 0xFC
+#define UI_CYAN   0x1F
+#define UI_GREEN  0x1C
+#define UI_RED    0xE0
+#define UI_LGREY  0xB6
+#define UI_DGREY  0x49
+#define UI_ORANGE 0xF4
+#define UI_W 320
+#define UI_H 240
+
+static uint8_t ui_buf[UI_W * UI_H];
+
+static void ui_fill(uint8_t c) { memset(ui_buf, c, sizeof(ui_buf)); }
+static void ui_hline(int x, int y, int len, uint8_t c) {
+    for (int i=x; i<x+len&&i<UI_W; i++) if (y>=0&&y<UI_H) ui_buf[y*UI_W+i]=c;
+}
+static void ui_vline(int x, int y, int len, uint8_t c) {
+    for (int i=y; i<y+len&&i<UI_H; i++) if (x>=0&&x<UI_W) ui_buf[i*UI_W+x]=c;
+}
+static void ui_rect(int x, int y, int w, int h, uint8_t c) {
+    ui_hline(x,y,w,c); ui_hline(x,y+h-1,w,c);
+    ui_vline(x,y,h,c); ui_vline(x+w-1,y,h,c);
+}
+static void ui_fill_rect(int x, int y, int w, int h, uint8_t c) {
+    for (int r=y; r<y+h&&r<UI_H; r++) ui_hline(x,r,w,c);
+}
+static void ui_char(int x, int y, char c, uint8_t col) {
+    if (c>='a'&&c<='z') c=c-'a'+'A';
+    const char* p=strchr(UI_FONT_CHARS,c); if (!p) return;
+    const uint8_t* g=UI_FONT_DATA[p-UI_FONT_CHARS];
+    for (int row=0;row<6;row++) for (int co=0;co<4;co++) {
+        if (!(g[row]&(0x8>>co))) continue;
+        int px=x+co, py=y+row;
+        if (px>=0&&px<UI_W&&py>=0&&py<UI_H) ui_buf[py*UI_W+px]=col;
+    }
+}
+static void ui_str(int x, int y, const char* s, uint8_t c) {
+    while (*s) { ui_char(x,y,*s++,c); x+=5; }
+}
+static void ui_char2x(int x, int y, char c, uint8_t col) {
+    if (c>='a'&&c<='z') c=c-'a'+'A';
+    const char* p=strchr(UI_FONT_CHARS,c); if (!p) return;
+    const uint8_t* g=UI_FONT_DATA[p-UI_FONT_CHARS];
+    for (int row=0;row<6;row++) for (int co=0;co<4;co++) {
+        if (!(g[row]&(0x8>>co))) continue;
+        for (int dy=0;dy<2;dy++) for (int dx=0;dx<2;dx++) {
+            int px=x+co*2+dx, py=y+row*2+dy;
+            if (px>=0&&px<UI_W&&py>=0&&py<UI_H) ui_buf[py*UI_W+px]=col;
+        }
+    }
+}
+static void ui_str2x(int x, int y, const char* s, uint8_t c) {
+    while (*s) { ui_char2x(x,y,*s++,c); x+=10; }
+}
+static void ui_bar(int x, int y, int mw, int h, int val, uint8_t fg, uint8_t bg) {
+    int f=(val*mw)/100;
+    ui_fill_rect(x,y,f,h,fg); ui_fill_rect(x+f,y,mw-f,h,bg);
+    ui_rect(x-1,y-1,mw+2,h+2,UI_DGREY);
+}
+
+// ============================================================================
+// PIXEL WRITE — full and partial
+// ============================================================================
+
+void write_pixel_color(int* ADDRESS) {
+    int img_addr=0;
+    for (int i=0;i<19200;i++) {
+        uint32_t word=IORD_32DIRECT(ADDRESS,i*4);
+        IOWR_ALTERA_AVALON_PIO_DATA(IMG_ADDR_BASE,img_addr++); IOWR_ALTERA_AVALON_PIO_DATA(PIXEL_BASE,(uint8_t)(word>>24)); IOWR_ALTERA_AVALON_PIO_DATA(WREN_BASE,1); IOWR_ALTERA_AVALON_PIO_DATA(WREN_BASE,0);
+        IOWR_ALTERA_AVALON_PIO_DATA(IMG_ADDR_BASE,img_addr++); IOWR_ALTERA_AVALON_PIO_DATA(PIXEL_BASE,(uint8_t)(word>>16)); IOWR_ALTERA_AVALON_PIO_DATA(WREN_BASE,1); IOWR_ALTERA_AVALON_PIO_DATA(WREN_BASE,0);
+        IOWR_ALTERA_AVALON_PIO_DATA(IMG_ADDR_BASE,img_addr++); IOWR_ALTERA_AVALON_PIO_DATA(PIXEL_BASE,(uint8_t)(word>>8));  IOWR_ALTERA_AVALON_PIO_DATA(WREN_BASE,1); IOWR_ALTERA_AVALON_PIO_DATA(WREN_BASE,0);
+        IOWR_ALTERA_AVALON_PIO_DATA(IMG_ADDR_BASE,img_addr++); IOWR_ALTERA_AVALON_PIO_DATA(PIXEL_BASE,(uint8_t)word);       IOWR_ALTERA_AVALON_PIO_DATA(WREN_BASE,1); IOWR_ALTERA_AVALON_PIO_DATA(WREN_BASE,0);
+    }
+}
+
+void write_pixel_array(const uint8_t* ADDRESS) {
+    for (int i=0;i<UI_W*UI_H;i++) {
+        IOWR_ALTERA_AVALON_PIO_DATA(IMG_ADDR_BASE,i);
+        IOWR_ALTERA_AVALON_PIO_DATA(PIXEL_BASE,ADDRESS[i]);
+        IOWR_ALTERA_AVALON_PIO_DATA(WREN_BASE,1); IOWR_ALTERA_AVALON_PIO_DATA(WREN_BASE,0);
+    }
+}
+
+// Flush a rectangle from ui_buf to the VGA frame buffer
+// Only changed regions need to be sent — VGA retains other pixels between calls
+static void write_region(int x, int y, int w, int h) {
+    for (int row=y; row<y+h&&row<UI_H; row++) {
+        for (int col=x; col<x+w&&col<UI_W; col++) {
+            int idx=row*UI_W+col;
+            IOWR_ALTERA_AVALON_PIO_DATA(IMG_ADDR_BASE, idx);
+            IOWR_ALTERA_AVALON_PIO_DATA(PIXEL_BASE, ui_buf[idx]);
+            IOWR_ALTERA_AVALON_PIO_DATA(WREN_BASE, 1);
+            IOWR_ALTERA_AVALON_PIO_DATA(WREN_BASE, 0);
+        }
+    }
+}
+
+// ============================================================================
+// HEADER + STATUS (shared across pages)
+// ============================================================================
+static void ui_draw_header(int page) {
+    char tmp[8];
+    ui_fill_rect(0,0,UI_W,16,UI_DGREY);
+    ui_str2x(4,2,"NIOS",UI_YELLOW); ui_str2x(44,2,"AI",UI_CYAN);
+    snprintf(tmp,sizeof(tmp),"PG %d/3",page+1);
+    ui_str(UI_W-36,5,tmp,UI_LGREY);
+    const char* names[]={"DASHBOARD","INFERENCE","SETTINGS"};
+    int nx=UI_W/2-(int)(strlen(names[page])*5/2);
+    ui_str(nx,5,names[page],UI_WHITE);
+    ui_hline(0,16,UI_W,UI_CYAN);
+}
+
+static void ui_draw_status(void) {
+    ui_fill_rect(0,UI_H-13,UI_W,13,UI_DGREY);
+    ui_hline(0,UI_H-14,UI_W,UI_CYAN);
+    ui_str(4,  UI_H-10,"CAM:",UI_LGREY);
+    ui_str(24, UI_H-10,is_spi        ?"ON ":"OFF",is_spi        ?UI_GREEN:UI_RED);
+    ui_str(52, UI_H-10,"CUBE:",UI_LGREY);
+    ui_str(77, UI_H-10,is_cube        ?"ON ":"OFF",is_cube        ?UI_GREEN:UI_LGREY);
+    ui_str(108,UI_H-10,"EMRG:",UI_LGREY);
+    ui_str(133,UI_H-10,emergency_stop?"ON ":"OFF",emergency_stop?UI_RED:UI_GREEN);
+    ui_str(163,UI_H-10,"ROT:",UI_LGREY);
+    ui_str(183,UI_H-10,settings_rot  ?"ON ":"OFF",settings_rot  ?UI_CYAN:UI_LGREY);
+    ui_str(210,UI_H-10,"K0<  K1>",UI_DGREY);
+}
+
+// ============================================================================
+// PAGE 0 — DASHBOARD
+// Content: left panel x=0-119, right panel x=120-319
+// Left panel is dynamic (CPU bars, accel, tilt bubble) — redrawn every tick
+// Right panel is static (controls list)             — redrawn only on full render
+// ============================================================================
+static void draw_page_dashboard(void) {
+    char tmp[24];
+    int c0=IORD_32DIRECT(CORE0_WRADDR,0);
+    int c1=IORD_32DIRECT(CORE1_WRADDR,0);
+    int c2=IORD_32DIRECT(CORE2_WRADDR,0);
+    int ax=(int32_t)IORD_32DIRECT(ACCE_WRADDR,0);
+    int ay=(int32_t)IORD_32DIRECT(ACCE_WRADDR,4);
+    int az=(int32_t)IORD_32DIRECT(ACCE_WRADDR,8);
+    int lx=4, cy=22; uint8_t ccol;
+
+    // CPU section
+    ui_str(lx,cy,"CPU USAGE",UI_LGREY); ui_hline(lx,cy+8,110,UI_DGREY); cy+=12;
+    ccol=c0>80?UI_RED:UI_GREEN;
+    ui_str(lx,cy,"C0",UI_WHITE); snprintf(tmp,sizeof(tmp),"%3d%",c0); ui_str(lx+14,cy,tmp,ccol);
+    ui_bar(lx,cy+8,108,5,c0,ccol,UI_DGREY); cy+=18;
+    ccol=c1>80?UI_RED:UI_GREEN;
+    ui_str(lx,cy,"C1",UI_WHITE); snprintf(tmp,sizeof(tmp),"%3d%",c1); ui_str(lx+14,cy,tmp,ccol);
+    ui_bar(lx,cy+8,108,5,c1,ccol,UI_DGREY); cy+=18;
+    ccol=c2>80?UI_RED:UI_GREEN;
+    ui_str(lx,cy,"C2",UI_WHITE); snprintf(tmp,sizeof(tmp),"%3d%",c2); ui_str(lx+14,cy,tmp,ccol);
+    ui_bar(lx,cy+8,108,5,c2,ccol,UI_DGREY); cy+=16;
+
+    ui_hline(lx,cy,110,UI_DGREY); cy+=6;
+
+    // Accel section
+    ui_str(lx,cy,"ACCELEROMETER",UI_LGREY); ui_hline(lx,cy+8,110,UI_DGREY); cy+=12;
+    snprintf(tmp,sizeof(tmp),"X %5d",ax); ui_str(lx,cy,tmp,UI_CYAN); cy+=9;
+    snprintf(tmp,sizeof(tmp),"Y %5d",ay); ui_str(lx,cy,tmp,UI_CYAN); cy+=9;
+    snprintf(tmp,sizeof(tmp),"Z %5d",az); ui_str(lx,cy,tmp,UI_CYAN);
+
+    // Tilt bubble (50×28 px, positioned to the right of the Z value)
+    int tx=lx+55, ty=cy-18;
+    ui_rect(tx,ty,50,28,UI_DGREY);
+    // Crosshairs
+    ui_hline(tx+1,ty+14,48,0x12);
+    ui_vline(tx+25,ty+1, 26,0x12);
+    // Clamp dot position to bubble interior
+    int dot_x=tx+25+(ax*20/512), dot_y=ty+14-(ay*11/512);
+    if (dot_x<tx+2)  dot_x=tx+2;  if (dot_x>tx+47) dot_x=tx+47;
+    if (dot_y<ty+2)  dot_y=ty+2;  if (dot_y>ty+25) dot_y=ty+25;
+    ui_fill_rect(dot_x-2,dot_y-2,5,5,UI_YELLOW); // 5×5 dot for visibility
+
+    // Right panel — static controls list (only rendered on full redraw)
+    ui_vline(120,20,UI_H-35,UI_DGREY);
+    int rx=126;
+    ui_str(rx,22,"CONTROLS",UI_LGREY); ui_hline(rx,30,190,UI_DGREY);
+    const char* ck[]={"KEY0","KEY1","SW6 ","SW5 ","SW4 ","SW1 ","SW1-2","SW10"};
+    const char* cd[]={"PREV PG/CONFIRM","NEXT PG/SKIP","CAMERA ON/OFF","CUBE MODE","PLAY MUSIC","SCROLL INFER","SCROLL WORD","LED CLEAR"};
+    for (int i=0;i<8;i++) {
+        int ky=34+i*12;
+        ui_str(rx,   ky,ck[i],UI_YELLOW);
+        ui_str(rx+32,ky,cd[i],UI_WHITE);
+    }
+}
+
+// ============================================================================
+// PAGE 1 — INFERENCE
+// ============================================================================
+static void draw_page_inference(void) {
+    uint8_t alpha_s[26], num_s[10];
+    for (int i=0;i<26;i++) alpha_s[i]=IORD_8DIRECT(SCORE_WRADDR,i);
+    for (int i=0;i<10;i++) num_s[i]  =IORD_8DIRECT(SCORE_WRADDR,26+i);
+
+    ui_str(4,22,"LETTER SCORES",UI_LGREY); ui_hline(0,30,UI_W,UI_DGREY);
+
+    #define INF_BASE 160
+    #define INF_H     28
+    #define INF_BW     5
+    #define INF_BG     1
+
+    for (int i=0;i<26;i++) {
+        int bx=4+i*(INF_BW+INF_BG);
+        int bh=(int)((uint32_t)alpha_s[i]*INF_H/100);
+        uint8_t col=alpha_s[i]>70?UI_GREEN:alpha_s[i]>30?UI_YELLOW:UI_DGREY;
+        ui_fill_rect(bx,INF_BASE-INF_H,INF_BW,INF_H,UI_DGREY);
+        if (bh>0) ui_fill_rect(bx,INF_BASE-bh,INF_BW,bh,col);
+        ui_rect(bx-1,INF_BASE-INF_H-1,INF_BW+2,INF_H+2,0x24);
+        ui_char(bx,INF_BASE+2,'A'+i,alpha_s[i]>30?col:UI_LGREY);
+    }
+    int nx0=4+26*(INF_BW+INF_BG)+6;
+    for (int i=0;i<10;i++) {
+        int bx=nx0+i*(INF_BW+INF_BG);
+        int bh=(int)((uint32_t)num_s[i]*INF_H/100);
+        uint8_t col=num_s[i]>70?UI_GREEN:num_s[i]>30?UI_YELLOW:UI_DGREY;
+        ui_fill_rect(bx,INF_BASE-INF_H,INF_BW,INF_H,UI_DGREY);
+        if (bh>0) ui_fill_rect(bx,INF_BASE-bh,INF_BW,bh,col);
+        ui_rect(bx-1,INF_BASE-INF_H-1,INF_BW+2,INF_H+2,0x24);
+        ui_char(bx,INF_BASE+2,'0'+i,num_s[i]>30?col:UI_LGREY);
+    }
+    ui_str(4,   INF_BASE-INF_H-10,"A-Z",UI_LGREY);
+    ui_str(nx0, INF_BASE-INF_H-10,"0-9",UI_LGREY);
+
+    int wy=INF_BASE+12;
+    ui_hline(0,wy,UI_W,UI_DGREY); wy+=4;
+    char wbuf[17]={0};
+    for (int i=0;i<16;i++) wbuf[i]=(char)IORD_8DIRECT(WORD_WRADDR,i);
+    wbuf[16]='\0';
+    int wlen=0; for (int i=0;i<16;i++) if (wbuf[i]>' ') wlen=i+1;
+    ui_str(4,wy,"DETECTED:",UI_LGREY);
+    if (wlen>0) ui_str2x(60,wy-2,wbuf,UI_YELLOW);
+    else        ui_str(60,wy,"---",UI_DGREY);
+}
+
+// ============================================================================
+// PAGE 2 — SETTINGS
+// ============================================================================
+static void draw_setting_row(int sy, const char* label, int sel, int val) {
+    uint8_t lc=sel?UI_YELLOW:UI_LGREY;
+    if (sel) { ui_fill_rect(0,sy-1,UI_W-1,14,0x09); ui_str(2,sy+3,">",UI_YELLOW); }
+    ui_str(12,sy+3,label,lc);
+    int oa=(val==1), fa=(val==0);
+    ui_fill_rect(160,sy,32,12,oa?UI_CYAN :UI_DGREY); ui_rect(160,sy,32,12,oa?UI_WHITE:UI_LGREY); ui_str(166,sy+3,"ON", oa?0x00:UI_LGREY);
+    ui_fill_rect(196,sy,36,12,fa?UI_RED  :UI_DGREY); ui_rect(196,sy,36,12,fa?UI_WHITE:UI_LGREY); ui_str(200,sy+3,"OFF",fa?0x00:UI_LGREY);
+}
+
+static void draw_page_settings(void) {
+    char tmp[40]; int sy=24;
+    ui_str(4,sy,"SYSTEM SETTINGS",UI_LGREY); ui_hline(0,sy+9,UI_W,UI_DGREY); sy+=16;
+    ui_str(4,sy,"KEY0:CONFIRM   KEY1:SKIP",UI_DGREY); sy+=14;
+    draw_setting_row(sy,"VIDEO ROTATION",settings_cursor==0,settings_rot); sy+=20;
+    ui_hline(4,sy,UI_W-8,0x12); sy+=6;
+    draw_setting_row(sy,"CUBE AUTO-SPIN",settings_cursor==1,settings_spin); sy+=20;
+    ui_hline(4,sy,UI_W-8,0x12); sy+=10;
+    ui_rect(4,sy,UI_W-8,32,UI_DGREY);
+    ui_str(8,sy+4,"ACTIVE CONFIG:",UI_LGREY);
+    snprintf(tmp,sizeof(tmp),"ROT:%s   CUBE-SPIN:%s",
+             settings_rot?"ON ":"OFF", settings_spin?"ON ":"OFF");
+    ui_str(8,sy+14,tmp,UI_CYAN); sy+=40;
+    ui_str(4,sy,"KEY0",UI_ORANGE); ui_str(24,sy,"TOGGLE HIGHLIGHTED + ADVANCE",UI_WHITE); sy+=10;
+    ui_str(4,sy,"KEY1",UI_LGREY);  ui_str(24,sy,"SKIP   HIGHLIGHTED + ADVANCE",UI_LGREY);
+}
+
+// ============================================================================
+// PAGE DISPATCH — FULL render + full VGA flush
+// Called on page changes and first frame
+// ============================================================================
+static void draw_ui_page(int page) {
+    ui_fill(UI_BLACK);
+    ui_draw_header(page);
+    switch (page) {
+        case 0: draw_page_dashboard(); break;
+        case 1: draw_page_inference(); break;
+        case 2: draw_page_settings();  break;
+    }
+    ui_draw_status();
+    write_pixel_array((const uint8_t*)ui_buf);
+}
+
+// ============================================================================
+// PARTIAL UPDATE — dashboard only
+// Only writes the left panel (dynamic: CPU + accel + tilt) and status bar.
+// Right panel (controls list) is static — VGA retains it from the last full render.
+//
+// Left panel:  x=0-119,   y=17-226  →  120 × 210 = 25200 pixels
+// Status bar:  x=0-319,   y=227-239 →  320 ×  13 =  4160 pixels
+// Total: 29360 px  vs  76800 full frame  →  ~2.6× faster per frame
+// ============================================================================
+static void draw_ui_page_partial(void) {
+    // Clear only the left panel in ui_buf so old text doesn't bleed through
+    for (int r=17; r<UI_H-13; r++)
+        ui_hline(0, r, 120, UI_BLACK);
+
+    // Re-render dashboard content (writes to all of ui_buf, but we only flush left)
+    draw_page_dashboard();
+
+    // Update and flush status bar (full width, reflects CAM/CUBE/EMRG state)
+    ui_draw_status();
+
+    // Flush only the two dynamic regions — the VGA SRAM holds the rest
+    write_region(0, 17,       120, UI_H-13-17);  // left panel
+    write_region(0, UI_H-14,  320, 14);          // status bar
+}
+
+// ============================================================================
+// KEY HANDLER
+// ============================================================================
+static void handle_key(int is_confirm) {
+    if (current_page == 2) {
+        if (is_confirm) {
+            if (settings_cursor==0) { settings_rot  = !settings_rot;  IOWR_8DIRECT(SETTINGS_WRADDR,0,settings_rot);  }
+            else                    { settings_spin = !settings_spin; IOWR_8DIRECT(SETTINGS_WRADDR,1,settings_spin); }
+        }
+        if (++settings_cursor >= 2) { settings_cursor = 0; current_page = 0; }
+        force_redraw = 1;  // settings page changed — force full redraw
+    } else {
+        current_page = is_confirm ? (current_page+2)%3 : (current_page+1)%3;
+        if (current_page == 2) settings_cursor = 0;
+        // page change detected via last_page != current_page → full redraw automatic
+    }
+}
+
+// ============================================================================
+// TASKS
+// ============================================================================
+#define TASK_STACKSIZE 1024
+OS_STK vga_task_stk        [TASK_STACKSIZE];
+OS_STK startup_task_stk    [TASK_STACKSIZE];
+OS_STK cpu_monitor_task_stk[TASK_STACKSIZE];
+#define VGA_PRIORITY     1
+#define CPU_MONITOR_PRIO 2
+
+void vga_task(void* pdata) {
+    INT8U err;
+    IOWR_8DIRECT(SETTINGS_WRADDR, 0, settings_rot);
+    IOWR_8DIRECT(SETTINGS_WRADDR, 1, settings_spin);
+
+    while (1) {
+        // 50ms timeout → up to 20fps UI refresh rate
+        // Previously 500ms → was limited to ~2fps
+        OSSemPend(vga_trigger_sem, OS_TICKS_PER_SEC / 20, &err);
+
+        if (!emergency_stop) {
+            emergency_counter = 0;
+
+            if (key0_click) { key0_click = 0; handle_key(1); }
+            if (key1_click) { key1_click = 0; handle_key(0); }
+
+            if (rx_buffer & 0x00000004) {
+                // Cube frame: copy DRAM → cube_buf → VGA
+                for (int i=0; i<(UI_W*UI_H)/4; i++) {
+                    uint32_t w=IORD_32DIRECT(DRAM_WRADDR,i*4);
+                    cube_buf[i*4+0]=(w>>24)&0xFF; cube_buf[i*4+1]=(w>>16)&0xFF;
+                    cube_buf[i*4+2]=(w>> 8)&0xFF; cube_buf[i*4+3]= w     &0xFF;
+                }
+                write_pixel_array(cube_buf);
+                rx_buffer &= ~0x00000004;
+                rx_buffer &= ~0x80000000;
+                IOWR_ALTERA_AVALON_PIO_DATA(IRQ_CORE2_TX_BASE, 0x80000000);
+                IOWR_ALTERA_AVALON_PIO_DATA(IRQ_CORE2_TX_BASE, 0x0);
+
+            } else if (rx_buffer & 0x80000000) {
+                // Camera frame
+                write_pixel_color(DRAM_WRADDR);
+                rx_buffer &= ~0x80000000;
+
+            } else if (!is_spi && !is_cube) {
+                // Idle: draw UI page
+                int page_changed = (current_page != last_page);
+
+                if (page_changed || force_redraw) {
+                    // Full render + full VGA flush on page change or forced
+                    draw_ui_page(current_page);
+                    last_page    = current_page;
+                    force_redraw = 0;
+                } else if (current_page == 0) {
+                    // Dashboard: fast partial update (left panel + status bar only)
+                    // Right panel is static in VGA — skipped for speed
+                    draw_ui_page_partial();
+                } else {
+                    // Inference and settings: full render
+                    // (inference bars span full width; settings only redraws on force_redraw)
+                    draw_ui_page(current_page);
+                }
+            }
+        }
+
+        if (emergency_stop) {
+            const uint8_t* img = (emergency_counter%2==0)
+                                 ? (uint8_t*)emergency_image
+                                 : (uint8_t*)emergencyIMG2;
+            write_pixel_array(img);
+            emergency_counter++;
+        }
+    }
+}
+
+void cpu_monitor_task(void* pdata) {
+    while (1) {
+        IOWR_32DIRECT(CORE2_WRADDR, 0, OSCPUUsage);
+        OSTimeDlyHMSM(0,0,0,500);
+    }
+}
+void startup_task(void* pdata) {
+    OSStatInit();
+    OSTaskCreateExt(vga_task,         NULL,(void*)&vga_task_stk        [TASK_STACKSIZE-1],VGA_PRIORITY,    VGA_PRIORITY,    vga_task_stk,        TASK_STACKSIZE,NULL,0);
+    OSTaskCreateExt(cpu_monitor_task, NULL,(void*)&cpu_monitor_task_stk[TASK_STACKSIZE-1],CPU_MONITOR_PRIO,CPU_MONITOR_PRIO,cpu_monitor_task_stk,TASK_STACKSIZE,NULL,0);
+    OSTaskDel(OS_PRIO_SELF);
+}
+int main(void) {
+    alt_printf("CPU Core 2 Alive\n");
+    vga_trigger_sem = OSSemCreate(0);
+    init_rx();
+    OSTaskCreateExt(startup_task,NULL,(void*)&startup_task_stk[TASK_STACKSIZE-1],0,0,startup_task_stk,TASK_STACKSIZE,NULL,0);
+    OSStart();
+    return 0;
+}
+
