@@ -227,11 +227,8 @@ void cpu_monitor_task(void* pdata) {
 void accel_task(void* pdata) {
     INT8U err;
     while (1) {
-        // Change timeout from 0 to 1 tick.
-        // If no interrupt happens, it times out and continues the loop!
         OSSemPend(rx_trigger_sem, 1, &err);
 
-        // Only process accelerometer data if the semaphore triggered successfully
         if (err == OS_ERR_NONE) {
             if (rx_buffer & 0x00008000) {
                 int32_t received_x = (int32_t)IORD_32DIRECT(ACCE_WRADDR, 0);
@@ -243,25 +240,23 @@ void accel_task(void* pdata) {
                     IOWR_ALTERA_AVALON_PIO_DATA(IRQ_CORE0_TX_BASE, 0x00010001);
                     IOWR_ALTERA_AVALON_PIO_DATA(IRQ_CORE0_TX_BASE, 0x00000000);
                     emergency_stop = 1;
-                    alt_printf("DEVICE UPSIDE DOWN\n");
                 }
                 if (received_z > -208 && emergency_stop) {
                     IOWR_ALTERA_AVALON_PIO_DATA(IRQ_CORE0_TX_BASE, 0x00020002);
                     IOWR_ALTERA_AVALON_PIO_DATA(IRQ_CORE0_TX_BASE, 0x00000000);
                     emergency_stop = 0;
-                    alt_printf("DEVICE BACK ALIVE\n");
                 }
 
-                // Determine current rotation
                 last_ax = (received_x != 0 || last_ax == 0) ? received_x : last_ax;
                 last_ay = (received_y != 0 || last_ay == 0) ? received_y : last_ay;
+
+                IOWR_32DIRECT(CORE0_WRADDR, 0, OSCPUUsage);
             }
         }
 
-        // MOVED OUTSIDE THE IF STATEMENT:
-        // This will now continuously render the 3D cube back-to-back,
-        // utilizing all available CPU time and stress-testing Core 0!
-        render_cube(last_ax, last_ay);
+        if (cube_mode || IORD_8DIRECT(SETTINGS_WRADDR, 3)) {
+            render_cube(last_ax, last_ay);
+        }
     }
 }
 

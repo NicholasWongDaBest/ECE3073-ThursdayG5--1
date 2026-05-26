@@ -40,7 +40,7 @@ static int current_page    = 0;
 static int settings_cursor = 0;
 static int settings_rot    = 1;
 static int settings_spin   = 1;
-#define NUM_PAGES 5
+#define NUM_PAGES 6
 
 static int last_page    = -1;
 static int force_redraw =  1;
@@ -52,6 +52,10 @@ static void handle_rx_interrupts(void* context, alt_u32 id);
 static void draw_ui_page(int page);
 static void draw_ui_page_partial(void);
 void write_pixel_array(const uint8_t* ADDRESS);
+
+static void set_cube_page(int active) {
+    IOWR_8DIRECT(SETTINGS_WRADDR, 3, active ? 1 : 0);
+}
 
 static void set_camera_page(int active) {
     IOWR_8DIRECT(SETTINGS_WRADDR, 2, active ? 1 : 0);
@@ -87,7 +91,7 @@ static void handle_rx_interrupts(void* context, alt_u32 id) {
 static const char UI_FONT_CHARS[] = " -:./0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZ%<>";
 static const uint8_t UI_FONT_DATA[44][6] = {
     {0x0,0x0,0x0,0x0,0x0,0x0},{0x0,0x0,0xF,0x0,0x0,0x0},{0x0,0x6,0x6,0x0,0x6,0x6},
-    {0x0,0x0,0x0,0x0,0x0,0xF},{0x1,0x2,0x4,0x8,0x4,0x2},{0x6,0x9,0x9,0x9,0x9,0x6},
+	{0x1, 0x2, 0x2, 0x4, 0x4, 0x8},{0x1,0x2,0x4,0x8,0x4,0x2},{0x6,0x9,0x9,0x9,0x9,0x6},
     {0x2,0x6,0x2,0x2,0x2,0x7},{0x6,0x9,0x1,0x2,0x4,0xF},{0xE,0x1,0x6,0x1,0x1,0xE},
     {0x9,0x9,0xF,0x1,0x1,0x1},{0xF,0x8,0xE,0x1,0x1,0xE},{0x6,0x8,0xE,0x9,0x9,0x6},
     {0xF,0x1,0x2,0x4,0x4,0x4},{0x6,0x9,0x6,0x9,0x9,0x6},{0x6,0x9,0x7,0x1,0x9,0x6},
@@ -232,7 +236,7 @@ static void ui_draw_header(int page) {
     // Base bar: dark blue-grey
     ui_fill_rect(0, 0, UI_W, 18, C_DBLUE);
     // Accent stripe along top edge — page-specific colour
-    uint8_t accent_cols[] = {C_CYAN, C_PURPLE, C_ORANGE, C_GREEN, C_YELLOW};
+    uint8_t accent_cols[] = {C_CYAN, C_PURPLE, C_ORANGE, C_GREEN, C_YELLOW, C_RED};
     uint8_t acc = accent_cols[page];
     ui_hline(0, 0, UI_W, acc);
     ui_hline(0, 1, UI_W, acc);
@@ -242,12 +246,12 @@ static void ui_draw_header(int page) {
     ui_str2x(44,4, "AI",   C_CYAN);
 
     // Page name centred
-    const char* names[] = {"DASHBOARD","INFERENCE","SETTINGS","CAMERA","3D Render"};
+    const char* names[] = {"DASHBOARD","INFERENCE","SETTINGS","CAMERA","3D Render", "SCAM MARKET TICKER"};
     ui_str_cx(UI_W/2, 6, names[page], C_WHITE);
 
     // Page pill top-right  "3/4"
-    char tmp[6]; snprintf(tmp,sizeof(tmp),"%d/5",page+1);
-    int px = UI_W - 20;
+    char tmp[6]; snprintf(tmp,sizeof(tmp),"%d.&6",page+1);
+    int px = UI_W - 25;
     ui_str(px, 6, tmp, acc);
 
     // Bottom separator
@@ -387,12 +391,12 @@ static void draw_page_dashboard(void) {
     ui_hline(rx, 32, UI_W-rx, C_DGREY);
 
     struct { const char* key; const char* desc; } ctrls[] = {
-            {"KEY0", "PREV PAGE / CONFIRM"},
-            {"KEY1", "NEXT PAGE / SKIP"},
-            {"PG 5", "3D RENDER ENGINE"},   // <-- Changed from SW5 CUBE MODE
+            {"KEY0", "PREV PAGE . & CONFIRM"},
+            {"KEY1", "NEXT PAGE . & SKIP"},
+            {"PG 5", "3D RENDER ENGINE"},
+            {"PG 6", "MARKET TICKER"},
             {"SW4",  "PLAY MUSIC"},
-            {"SW1",  "SCROLL INFERENCE"},
-            {"SW1-2","SCROLL WORD"},
+            {"SW1/2","SCROLL INF. & WORD"}, // Merged to save space
             {"SW10", "CLEAR LEDS"},
             {"PG 4", "CAMERA AI VIEW"},
         };
@@ -659,6 +663,202 @@ static void draw_page_cube(void) {
 }
 
 // ============================================================================
+// PAGE 3 — CAMERA (waiting / live indicator)
+// ============================================================================
+#define NUM_STOCKS 4
+#define HIST_LEN   15  // Number of candles rendered on the chart
+
+typedef struct {
+    int open;
+    int close;
+    int high;
+    int low;
+} Candle;
+
+// Distinct historical data storage for each individual asset
+static Candle stock_history[NUM_STOCKS][HIST_LEN];
+static int history_initialized = 0;
+static int update_ticks[NUM_STOCKS] = {0, 0, 0, 0};
+
+static void draw_page_market(void) {
+    // Read detected word from AI
+    char wbuf[17]={0};
+    for(int i=0;i<16;i++) wbuf[i]=(char)IORD_8DIRECT(WORD_WRADDR,i);
+    wbuf[16]='\0';
+
+    // Draw the Terminal UI Card
+    ui_fill_rect(10, 26, UI_W-20, UI_H-46, C_DBLUE);
+    ui_rrect(10, 26, UI_W-20, UI_H-46, C_CYAN, 0xFF);
+    ui_str_cx(UI_W/2, 34, "LIVE STOCK EXCHANGE", C_CYAN);
+    ui_hline(10, 46, UI_W-20, C_DGREY);
+
+    // Identify stock index and core base price in cents
+    int base_cents = 0;
+    int stock_idx = -1;
+    if (strncmp(wbuf, "AAPL", 4) == 0)      { base_cents = 23224; stock_idx = 0; }
+    else if (strncmp(wbuf, "MSFT", 4) == 0) { base_cents = 41550; stock_idx = 1; }
+    else if (strncmp(wbuf, "NVDA", 4) == 0) { base_cents = 17410; stock_idx = 2; }
+    else if (strncmp(wbuf, "TSLA", 4) == 0) { base_cents = 21245; stock_idx = 3; }
+
+    // Initialize distinct random-walk chart histories once on startup
+    if (!history_initialized) {
+        int bases[4] = {23224, 41550, 17410, 21245};
+        for (int s = 0; s < NUM_STOCKS; s++) {
+            int current = bases[s];
+            for (int i = 0; i < HIST_LEN; i++) {
+                stock_history[s][i].open = current;
+
+                // Formulate a distinct baseline pattern path unique to each market index
+                int delta = ((i * 23 + s * 43) % 260) - 120;
+                stock_history[s][i].close = current + delta;
+
+                int max_oc = (stock_history[s][i].open > stock_history[s][i].close) ? stock_history[s][i].open : stock_history[s][i].close;
+                int min_oc = (stock_history[s][i].open < stock_history[s][i].close) ? stock_history[s][i].open : stock_history[s][i].close;
+
+                stock_history[s][i].high = max_oc + 30 + (i % 4) * 10;
+                stock_history[s][i].low  = min_oc - 30 - (i % 3) * 10;
+                if (stock_history[s][i].low < 0) stock_history[s][i].low = 0;
+
+                current = stock_history[s][i].close;
+            }
+        }
+        history_initialized = 1;
+    }
+
+    if (stock_idx != -1) {
+        // Read accelerometer to act as our live source
+        int ax = (int32_t)IORD_32DIRECT(ACCE_WRADDR, 0);
+        int ay = (int32_t)IORD_32DIRECT(ACCE_WRADDR, 4);
+
+        // Calculate dynamic real-time live price fluctuation
+        int fluctuation = (ax * 3) + (ay * 2);
+        int current_cents = base_cents + fluctuation;
+        if(current_cents < 0) current_cents = 0;
+
+        // Split into Dollars and Cents
+        int dollars = current_cents / 100;
+        int cents = current_cents % 100;
+        if(cents < 0) cents = -cents;
+
+        // Assign live calculated ticks to the active candle frame (the latest array index)
+        int live_idx = HIST_LEN - 1;
+        stock_history[stock_idx][live_idx].close = current_cents;
+
+        int live_max_oc = (stock_history[stock_idx][live_idx].open > current_cents) ? stock_history[stock_idx][live_idx].open : current_cents;
+        int live_min_oc = (stock_history[stock_idx][live_idx].open < current_cents) ? stock_history[stock_idx][live_idx].open : current_cents;
+
+        stock_history[stock_idx][live_idx].high = live_max_oc + 35;
+        stock_history[stock_idx][live_idx].low  = live_min_oc - 35;
+        if(stock_history[stock_idx][live_idx].low < 0) stock_history[stock_idx][live_idx].low = 0;
+
+        // Shift history left periodically to create moving candles
+        update_ticks[stock_idx]++;
+        if (update_ticks[stock_idx] >= 25) {  // Shift candle interval spacing threshold
+            update_ticks[stock_idx] = 0;
+            for (int i = 0; i < HIST_LEN - 1; i++) {
+                stock_history[stock_idx][i] = stock_history[stock_idx][i+1];
+            }
+            // Next candle's open matches the closed candle's terminal value
+            stock_history[stock_idx][HIST_LEN - 1].open = current_cents;
+        }
+
+        // Render Asset Info & Live Price Header
+        ui_str2x(25, 52, wbuf, C_WHITE);
+
+        char pstr[16];
+        snprintf(pstr, sizeof(pstr), "$%d.%02d", dollars, cents);
+        uint8_t pcol = (fluctuation >= 0) ? C_GREEN : C_RED;
+        ui_str2x(125, 52, pstr, pcol);
+
+        // Status Tag Indicator
+        if (fluctuation >= 0) ui_str(250, 58, "+ LIVE UP", C_GREEN);
+        else                  ui_str(250, 58, "- LIVE DN", C_RED);
+
+        // Render Volume Data
+        char vstr[32];
+        snprintf(vstr, sizeof(vstr), "VOL: %d,000", 1400 + (abs(ax) % 500));
+        ui_str(25, 74, vstr, C_LGREY);
+
+        // ====================================================================
+        // CANDLESTICK CHART LAYOUT ENGINE
+        // ====================================================================
+        int chart_x = 25;
+        int chart_y = 92;
+        int chart_w = 255; // 15 candles * 17 horizontal pixels spacing = 255
+        int chart_h = 96;
+
+        // Draw background canvas border lines
+        ui_rect(chart_x, chart_y, chart_w, chart_h, C_DGREY);
+        ui_hline(chart_x + 1, chart_y + (chart_h / 2), chart_w - 2, C_DGREY); // Center baseline
+
+        // Calculate maximum and minimum range bounds inside the active history screen frame
+        int global_min = 99999999;
+        int global_max = 0;
+        for (int i = 0; i < HIST_LEN; i++) {
+            if (stock_history[stock_idx][i].low < global_min)  global_min = stock_history[stock_idx][i].low;
+            if (stock_history[stock_idx][i].high > global_max) global_max = stock_history[stock_idx][i].high;
+        }
+        int price_range = global_max - global_min;
+        if (price_range <= 0) price_range = 1;
+
+        // Draw side bounding reference tags
+        char max_lbl[12], min_lbl[12];
+        snprintf(max_lbl, sizeof(max_lbl), "$%d", global_max / 100);
+        snprintf(min_lbl, sizeof(min_lbl), "$%d", global_min / 100);
+        ui_str(chart_x + chart_w + 4, chart_y, max_lbl, C_MGREY);
+        ui_str(chart_x + chart_w + 4, chart_y + chart_h - 8, min_lbl, C_MGREY);
+
+        // Loop and render individual candlesticks
+        int slot_w = 17;
+        int body_w = 9;
+        for (int i = 0; i < HIST_LEN; i++) {
+            int cx = chart_x + (i * slot_w) + (slot_w / 2); // Center line coordinate for wick
+            int bx = cx - (body_w / 2);                     // Left side pixel index for candle body
+
+            // Internal padding height alignment constraints
+            int inner_h = chart_h - 12;
+            int y_top_bound = chart_y + 6;
+            int y_bot_bound = chart_y + chart_h - 6;
+
+            // Scale target data entries directly into vertical pixel lines
+            int y_open  = y_bot_bound - ((stock_history[stock_idx][i].open  - global_min) * inner_h / price_range);
+            int y_close = y_bot_bound - ((stock_history[stock_idx][i].close - global_min) * inner_h / price_range);
+            int y_high  = y_bot_bound - ((stock_history[stock_idx][i].high  - global_min) * inner_h / price_range);
+            int y_low   = y_bot_bound - ((stock_history[stock_idx][i].low   - global_min) * inner_h / price_range);
+
+            uint8_t candle_col = (stock_history[stock_idx][i].close >= stock_history[stock_idx][i].open) ? C_GREEN : C_RED;
+
+            // 1. Draw Wick Line Component
+            int wick_len = y_low - y_high + 1;
+            if (wick_len > 0) {
+                ui_vline(cx, y_high, wick_len, candle_col);
+            }
+
+            // 2. Draw Candlestick Solid Center Body Rectangle
+            if (stock_history[stock_idx][i].close >= stock_history[stock_idx][i].open) {
+                // Bullish Candle (Green Fill)
+                int body_h = y_open - y_close + 1;
+                ui_fill_rect(bx, y_close, body_w, body_h, C_GREEN);
+            } else {
+                // Bearish Candle (Red Fill)
+                int body_h = y_close - y_open + 1;
+                ui_fill_rect(bx, y_open, body_w, body_h, C_RED);
+            }
+        }
+
+        // Adjusted asset track info string further down to avoid overlaying graph frame
+        wbuf[4] = '\0';
+        char bot_prompt[32];
+        snprintf(bot_prompt, sizeof(bot_prompt), "TRACKING ASSET: %s", wbuf);
+        ui_str_cx(UI_W/2, 202, bot_prompt, C_YELLOW);
+
+    } else {
+        // Idle State when no known company is detected
+        ui_str_cx(UI_W/2, 100, "WAITING FOR SYMBOL...", C_ORANGE);
+        ui_str_cx(UI_W/2, 120, "SCAN: AAPL, MSFT, GOOG, TSLA", C_MGREY);
+    }
+}
+// ============================================================================
 // FULL PAGE DISPATCH
 // ============================================================================
 static void draw_ui_page(int page) {
@@ -670,6 +870,7 @@ static void draw_ui_page(int page) {
         case 2: draw_page_settings();  break;
         case 3: draw_page_camera();    break;
         case 4: draw_page_cube(); break;
+        case 5: draw_page_market();    break;
     }
     ui_draw_status();
     write_pixel_array((const uint8_t*)ui_buf);
@@ -702,8 +903,21 @@ static void handle_key(int is_confirm) {
             : (current_page+1)%NUM_PAGES;
         if(current_page==2) settings_cursor=0;
     }
+
+    // Camera page transitions
     if(prev_page==3 && current_page!=3) set_camera_page(0);
-    if(prev_page!=3 && current_page==3) set_camera_page(1);
+    if(prev_page!=3 && current_page==3) {
+        set_camera_page(1);
+        rx_buffer &= ~0x00000004;
+        is_cube = 0;
+    }
+
+    // Cube page transitions — tells Core 0 to start/stop rendering
+    if(prev_page==4 && current_page!=4) set_cube_page(0);
+    if(prev_page!=4 && current_page==4) {
+        set_cube_page(1);
+        force_redraw = 1;
+    }
 }
 
 // ============================================================================
@@ -720,7 +934,7 @@ void vga_task(void* pdata){
     INT8U err;
     IOWR_8DIRECT(SETTINGS_WRADDR,0,settings_rot);
     IOWR_8DIRECT(SETTINGS_WRADDR,1,settings_spin);
-    IOWR_8DIRECT(SETTINGS_WRADDR,2,0);
+    IOWR_8DIRECT(SETTINGS_WRADDR,3,0);
 
     while(1){
         OSSemPend(vga_trigger_sem, OS_TICKS_PER_SEC/20, &err);
@@ -730,7 +944,8 @@ void vga_task(void* pdata){
             if(key0_click){key0_click=0;handle_key(1);}
             if(key1_click){key1_click=0;handle_key(0);}
 
-            if(rx_buffer & 0x00000004){
+            if ((rx_buffer & 0x00000004) && current_page != 3) {
+                // Cube frame — only display if NOT on camera page
                 for(int i=0;i<(UI_W*UI_H)/4;i++){
                     uint32_t w=IORD_32DIRECT(DRAM_WRADDR,i*4);
                     cube_buf[i*4+0]=(w>>24)&0xFF;cube_buf[i*4+1]=(w>>16)&0xFF;

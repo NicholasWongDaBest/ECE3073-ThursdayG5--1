@@ -205,6 +205,14 @@ void camera_spi_task(void* pdata) {
             while (!(IORD_ALTERA_AVALON_SPI_STATUS(SPI_BASE) & 0x80));
             IORD_ALTERA_AVALON_SPI_RXDATA(SPI_BASE);
             IOWR_ALTERA_AVALON_SPI_SLAVE_SEL(SPI_BASE, 0x0);
+
+            // Score-only: give ESP32 time to return from slave.wait() and call slave.queue().
+            // Camera mode doesn't need this — its SPI packets are queued inside sendImage()
+            // so the ESP32 is always ahead of the master there.
+            if (!start_spi) {
+                OSTimeDlyHMSM(0, 0, 0, 20);  // 20ms >> ESP32 queue latency (~1-5µs)
+            }
+
             trigger_sent = 1;
         }
 

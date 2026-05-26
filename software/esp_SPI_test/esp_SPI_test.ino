@@ -46,11 +46,14 @@ void sendScores();
 // Preset word matcher — add after renderSidebars(), before rotateCenter()
 // ---------------------------------------------------------------------------
 
+// In ESP32 — replace PRESET_WORDS array:
 const char* PRESET_WORDS[] = {
+    "AAPL ", "MSFT ", "GOOG ", "TSLA ",
+    "AMZN ", "NVDA ", "META ", "NFLX ",
     "HELLO ", "YELLOW ", "GREEN ", "RED "
 };
 #define PRESET_COUNT  (sizeof(PRESET_WORDS) / sizeof(PRESET_WORDS[0]))
-#define MATCH_THRESH    0.7f
+#define MATCH_THRESH    0.6f
 #define COOLDOWN_FRAMES 15
 #define MIN_DETECTIONS  2    // ignore frames with only 1 box (noise)
 
