@@ -57,6 +57,7 @@ This project is an embedded systems-based solution using the Intel FGPA DE10 pla
         - HEX displays
         - Push buttons
         - GPIO pins
+    - Assignment instruction can be found [here](nios_setup.txt)
     - Save assignments
 
 5. Compile the Project
@@ -77,6 +78,11 @@ This project is an embedded systems-based solution using the Intel FGPA DE10 pla
         - New Application Project
         - Select your .sopcinfo file
     - Choose template (e.g., Hello World or blank)
+    - Upon generating BSP files
+        - Right click the BSP files
+        - Go to Linker Script tab
+        - Setup the SDRAM memory map
+        - SDRAM memory mapping can be found [here](nios_setup.txt)
 
 8. Build and Run
     - Copy & Paste / Write your C code to:
