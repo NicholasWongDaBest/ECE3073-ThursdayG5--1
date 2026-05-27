@@ -199,6 +199,10 @@ set_location_assignment PIN_L19 -to hex345_export[23]
 set_location_assignment PIN_Y7 -to vga_clk_check
 set_location_assignment PIN_AA2 -to spi_ready
 set_location_assignment PIN_Y3 -to SPI_SS_N[0]
+set_global_assignment -name VERILOG_FILE vga_pll.v
+set_global_assignment -name VERILOG_FILE pxl.v
+set_global_assignment -name VERILOG_FILE PIXbuffer.v
+set_global_assignment -name VERILOG_FILE counter.v
 set_global_assignment -name VERILOG_FILE us_counter.v
 set_global_assignment -name VERILOG_FILE vga_controller.v
 set_global_assignment -name QSYS_FILE m2_nios2.qsys
